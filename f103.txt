@@ -1,0 +1,619 @@
+/* ============================================
+ * 핵심 헤더 및 정의
+ * ============================================ */
+#include "main.h"
+#include "rtc.h"
+#include "gpio.h"
+#include <string.h>
+
+// 플래시 저장 관련
+// STM32F103C8T6: 64KB Flash (0x08000000 ~ 0x0800FFFF)
+// Page size: 1KB (0x400)
+// Page 0~61: 코드 영역
+// Page 62: 통계값 (0x0800F800 ~ 0x0800FBFF)
+// Page 63: 설정값 (0x0800FC00 ~ 0x0800FFFF)
+
+#define FLASH_BASE_ADDR         0x08000000
+#define FLASH_PAGE_SIZE         0x400       // 1KB
+#define FLASH_TOTAL_SIZE        0x10000     // 64KB
+
+#define FLASH_PAGE_62           62
+#define FLASH_PAGE_63           63
+
+#define FLASH_STATS_ADDR        (FLASH_BASE_ADDR + (FLASH_PAGE_62 * FLASH_PAGE_SIZE))  // 0x0800F800
+#define FLASH_CONFIG_ADDR       (FLASH_BASE_ADDR + (FLASH_PAGE_63 * FLASH_PAGE_SIZE))  // 0x0800FC00
+
+// 설정값 구조체
+typedef struct {
+    uint32_t magic;           // 0xA5A5A5A5 (유효성 검증)
+    uint16_t on_seconds;      // ON 시간 (초)
+    uint16_t off_minutes;     // OFF 시간 (분)
+    uint16_t write_count;     // 쓰기 횟수 (마모 레벨링용)
+    uint16_t checksum;        // 체크섬
+} Config_t;
+
+// 통계값 구조체
+typedef struct {
+    uint32_t magic;                 // 0x5A5A5A5A
+    uint32_t total_on_seconds;      // 전체 누적 ON 시간 (초)
+    uint32_t weekly_on_seconds[4];  // 주별 ON 시간 (4주)
+    uint32_t monthly_on_seconds[12];// 월별 ON 시간 (12개월)
+    uint8_t current_week;           // 현재 주 인덱스 (0-3)
+    uint8_t current_month;          // 현재 월 (1-12)
+    uint16_t current_year;          // 현재 년도
+    uint32_t last_save_time;        // 마지막 저장 시간 (RTC timestamp)
+    uint16_t checksum;
+} Statistics_t;
+
+#define CONFIG_MAGIC    0xA5A5A5A5
+#define STATS_MAGIC     0x5A5A5A5A
+
+// 전역 변수
+Config_t g_config = {
+    .magic = CONFIG_MAGIC,
+    .on_seconds = 60,      // 기본값: 1분
+    .off_minutes = 10,     // 기본값: 10분
+    .write_count = 0,
+    .checksum = 0
+};
+
+Statistics_t g_stats = {
+    .magic = STATS_MAGIC,
+    .total_on_seconds = 0,
+    .weekly_on_seconds = {0},
+    .monthly_on_seconds = {0},
+    .current_week = 0,
+    .current_month = 1,
+    .current_year = 2025,
+    .last_save_time = 0,
+    .checksum = 0
+};
+
+typedef enum {
+    STATE_IDLE,
+    STATE_PREPARE_ON,
+    STATE_PREPARE_OFF,
+    STATE_WAKEUP
+} System_State_t;
+
+System_State_t g_state = STATE_IDLE;
+uint8_t g_sleep_flag = 0;
+uint32_t g_on_start_timestamp = 0;  // ON 시작 시간
+
+/* ============================================
+ * 플래시 읽기/쓰기 함수
+ * ============================================ */
+
+// 체크섬 계산
+uint16_t Calculate_Checksum(void* data, size_t size) {
+    uint16_t sum = 0;
+    uint8_t* ptr = (uint8_t*)data;
+    for(int i = 0; i < size - sizeof(uint16_t); i++) {
+        sum += ptr[i];
+    }
+    return sum;
+}
+
+// RTC 타임스탬프 얻기
+uint32_t RTC_GetTimestamp(void) {
+    RTC_TimeTypeDef time = {0};
+    RTC_DateTypeDef date = {0};
+    
+    HAL_RTC_GetTime(&hrtc, &time, RTC_FORMAT_BIN);
+    HAL_RTC_GetDate(&hrtc, &date, RTC_FORMAT_BIN);
+    
+    // 간단한 타임스탬프 (초 단위)
+    return date.Date * 86400 + time.Hours * 3600 + time.Minutes * 60 + time.Seconds;
+}
+
+// 플래시에서 설정 읽기
+HAL_StatusTypeDef Config_Load(void) {
+    Config_t* flash_cfg = (Config_t*)FLASH_CONFIG_ADDR;
+    
+    // 유효성 검증
+    if(flash_cfg->magic == CONFIG_MAGIC) {
+        uint16_t calc_sum = Calculate_Checksum(flash_cfg, sizeof(Config_t));
+        if(calc_sum == flash_cfg->checksum) {
+            memcpy(&g_config, flash_cfg, sizeof(Config_t));
+            return HAL_OK;
+        }
+    }
+    
+    // 유효하지 않으면 기본값 사용
+    g_config.magic = CONFIG_MAGIC;
+    g_config.on_seconds = 60;
+    g_config.off_minutes = 10;
+    g_config.write_count = 0;
+    return HAL_ERROR;
+}
+
+// 플래시에서 통계 읽기
+HAL_StatusTypeDef Stats_Load(void) {
+    Statistics_t* flash_stats = (Statistics_t*)FLASH_STATS_ADDR;
+    
+    if(flash_stats->magic == STATS_MAGIC) {
+        uint16_t calc_sum = Calculate_Checksum(flash_stats, sizeof(Statistics_t));
+        if(calc_sum == flash_stats->checksum) {
+            memcpy(&g_stats, flash_stats, sizeof(Statistics_t));
+            return HAL_OK;
+        }
+    }
+    
+    // 유효하지 않으면 초기화
+    g_stats.magic = STATS_MAGIC;
+    g_stats.total_on_seconds = 0;
+    memset(g_stats.weekly_on_seconds, 0, sizeof(g_stats.weekly_on_seconds));
+    memset(g_stats.monthly_on_seconds, 0, sizeof(g_stats.monthly_on_seconds));
+    
+    RTC_DateTypeDef date = {0};
+    HAL_RTC_GetDate(&hrtc, &date, RTC_FORMAT_BIN);
+    g_stats.current_month = date.Month;
+    g_stats.current_year = 2000 + date.Year;
+    g_stats.current_week = 0;
+    
+    return HAL_ERROR;
+}
+
+// 플래시에 설정 저장
+HAL_StatusTypeDef Config_Save(void) {
+    HAL_StatusTypeDef status;
+    uint32_t page_error = 0;
+    
+    // 쓰기 횟수 증가
+    g_config.write_count++;
+    g_config.checksum = Calculate_Checksum(&g_config, sizeof(Config_t));
+    
+    // 플래시 언락
+    HAL_FLASH_Unlock();
+    
+    // 페이지 지우기
+    FLASH_EraseInitTypeDef erase_init;
+    erase_init.TypeErase = FLASH_TYPEERASE_PAGES;
+    erase_init.PageAddress = FLASH_CONFIG_ADDR;
+    erase_init.NbPages = 1;
+    
+    status = HAL_FLASHEx_Erase(&erase_init, &page_error);
+    if(status != HAL_OK) {
+        HAL_FLASH_Lock();
+        return status;
+    }
+    
+    // 데이터 쓰기
+    uint32_t* data_ptr = (uint32_t*)&g_config;
+    uint32_t addr = FLASH_CONFIG_ADDR;
+    
+    for(int i = 0; i < sizeof(Config_t)/4; i++) {
+        status = HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr, data_ptr[i]);
+        if(status != HAL_OK) {
+            HAL_FLASH_Lock();
+            return status;
+        }
+        addr += 4;
+    }
+    
+    HAL_FLASH_Lock();
+    return HAL_OK;
+}
+
+// 플래시에 통계 저장
+HAL_StatusTypeDef Stats_Save(void) {
+    HAL_StatusTypeDef status;
+    uint32_t page_error = 0;
+    
+    g_stats.last_save_time = RTC_GetTimestamp();
+    g_stats.checksum = Calculate_Checksum(&g_stats, sizeof(Statistics_t));
+    
+    HAL_FLASH_Unlock();
+    
+    FLASH_EraseInitTypeDef erase_init;
+    erase_init.TypeErase = FLASH_TYPEERASE_PAGES;
+    erase_init.PageAddress = FLASH_STATS_ADDR;
+    erase_init.NbPages = 1;
+    
+    status = HAL_FLASHEx_Erase(&erase_init, &page_error);
+    if(status != HAL_OK) {
+        HAL_FLASH_Lock();
+        return status;
+    }
+    
+    uint32_t* data_ptr = (uint32_t*)&g_stats;
+    uint32_t addr = FLASH_STATS_ADDR;
+    
+    for(int i = 0; i < sizeof(Statistics_t)/4; i++) {
+        status = HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr, data_ptr[i]);
+        if(status != HAL_OK) {
+            HAL_FLASH_Lock();
+            return status;
+        }
+        addr += 4;
+    }
+    
+    HAL_FLASH_Lock();
+    return HAL_OK;
+}
+
+// ON 시간 누적 업데이트
+void Stats_Update_OnTime(uint32_t on_duration_seconds) {
+    RTC_DateTypeDef date = {0};
+    HAL_RTC_GetDate(&hrtc, &date, RTC_FORMAT_BIN);
+    
+    // 월 변경 감지
+    if(date.Month != g_stats.current_month) {
+        // 새로운 월로 넘어가면 해당 월 초기화
+        g_stats.current_month = date.Month;
+        g_stats.current_year = 2000 + date.Year;
+    }
+    
+    // 주 변경 감지 (4주 순환)
+    // 간단하게 날짜/7로 계산
+    uint8_t week_index = (date.Date / 7) % 4;
+    if(week_index != g_stats.current_week) {
+        g_stats.current_week = week_index;
+        g_stats.weekly_on_seconds[week_index] = 0;  // 새 주 시작
+    }
+    
+    // 누적 시간 업데이트
+    g_stats.total_on_seconds += on_duration_seconds;
+    g_stats.weekly_on_seconds[g_stats.current_week] += on_duration_seconds;
+    g_stats.monthly_on_seconds[date.Month - 1] += on_duration_seconds;
+    
+    // 플래시 저장 (10분마다 또는 1시간 누적 시)
+    static uint32_t last_save_seconds = 0;
+    if(g_stats.total_on_seconds - last_save_seconds >= 600) {  // 10분마다
+        Stats_Save();
+        last_save_seconds = g_stats.total_on_seconds;
+    }
+}
+
+/* ============================================
+ * RTC 알람 설정
+ * ============================================ */
+
+void RTC_SetWakeup(uint32_t seconds) {
+    RTC_AlarmTypeDef alarm = {0};
+    RTC_TimeTypeDef time = {0};
+    RTC_DateTypeDef date = {0};
+    
+    // 현재 시간 가져오기
+    HAL_RTC_GetTime(&hrtc, &time, RTC_FORMAT_BIN);
+    HAL_RTC_GetDate(&hrtc, &date, RTC_FORMAT_BIN);
+    
+    // 알람 계산
+    uint32_t total_seconds = time.Hours * 3600 + time.Minutes * 60 + time.Seconds + seconds;
+    
+    alarm.AlarmTime.Hours = (total_seconds / 3600) % 24;
+    alarm.AlarmTime.Minutes = (total_seconds / 60) % 60;
+    alarm.AlarmTime.Seconds = total_seconds % 60;
+    alarm.AlarmTime.SubSeconds = 0;
+    alarm.AlarmTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+    alarm.AlarmTime.StoreOperation = RTC_STOREOPERATION_RESET;
+    alarm.AlarmDateWeekDaySel = RTC_ALARMDATEWEEKDAYSEL_DATE;
+    alarm.AlarmDateWeekDay = 1;
+    alarm.AlarmMask = RTC_ALARMMASK_DATEWEEKDAY;
+    alarm.Alarm = RTC_ALARM_A;
+    
+    HAL_RTC_SetAlarm_IT(&hrtc, &alarm, RTC_FORMAT_BIN);
+}
+
+/* ============================================
+ * 저전력 모드 진입
+ * ============================================ */
+
+void Enter_StopMode(void) {
+    // GPIO를 아날로그 모드로 변경 (전력 최소화)
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = GPIO_PIN_All;
+    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    
+    // PA1(릴레이)는 제외
+    GPIO_InitStruct.Pin = GPIO_PIN_All & ~GPIO_PIN_1;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+    
+    // STOP 모드 진입
+    HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
+    
+    // 깨어난 후 클럭 재설정 필요
+    SystemClock_Config();
+    
+    // GPIO 재초기화 (필요한 핀만)
+    MX_GPIO_Init();  // CubeMX 생성 함수 호출
+}
+
+/* ============================================
+ * RTC 알람 인터럽트 핸들러
+ * ============================================ */
+
+uint8_t g_relay_state = 0;  // 0: OFF였음, 1: ON이었음
+
+void HAL_RTC_AlarmAEventCallback(RTC_HandleTypeDef *hrtc) {
+    // 알람 플래그 클리어
+    __HAL_RTC_ALARM_CLEAR_FLAG(hrtc, RTC_FLAG_ALRAF);
+    
+    // 현재 릴레이 상태 확인하여 다음 동작 결정
+    if(g_relay_state == 0) {
+        // OFF 시간 끝 -> ON 준비
+        g_state = STATE_PREPARE_ON;
+        g_relay_state = 1;
+    } else {
+        // ON 시간 끝 -> OFF 준비
+        g_state = STATE_PREPARE_OFF;
+        g_relay_state = 0;
+    }
+    
+    g_sleep_flag = 0;  // 깨어남
+}
+
+/* ============================================
+ * 논블럭 메인 제어 로직
+ * ============================================ */
+
+void System_Init(void) {
+    // 설정 및 통계 로드
+    Config_Load();
+    Stats_Load();
+    
+    // 릴레이 초기화 (OFF)
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET);
+    
+    // RTC 알람 인터럽트 활성화
+    __HAL_RTC_ALARM_ENABLE_IT(&hrtc, RTC_IT_ALRA);
+    
+    // 초기 상태
+    g_state = STATE_IDLE;
+}
+
+void System_Process(void) {
+    switch(g_state) {
+        case STATE_IDLE:
+            // 시작: ON 상태 준비
+            g_state = STATE_PREPARE_ON;
+            break;
+            
+        case STATE_PREPARE_ON:
+            // 릴레이 ON
+            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_SET);
+            
+            // ON 시작 시간 기록
+            g_on_start_timestamp = RTC_GetTimestamp();
+            
+            // ON 시간 알람 설정
+            RTC_SetWakeup(g_config.on_seconds);
+            
+            // 슬립 준비
+            g_state = STATE_WAKEUP;
+            g_sleep_flag = 1;
+            break;
+            
+        case STATE_PREPARE_OFF:
+            // 릴레이 OFF
+            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET);
+            
+            // ON 시간 누적 계산
+            uint32_t on_duration = RTC_GetTimestamp() - g_on_start_timestamp;
+            Stats_Update_OnTime(on_duration);
+            
+            // OFF 시간 알람 설정
+            RTC_SetWakeup(g_config.off_minutes * 60);
+            
+            // 슬립 준비
+            g_state = STATE_WAKEUP;
+            g_sleep_flag = 1;
+            break;
+            
+        case STATE_WAKEUP:
+            // RTC 알람으로 깨어남 후 대기
+            // 실제 상태 전환은 RTC 콜백에서 처리
+            break;
+    }
+}
+
+/* ============================================
+ * UI 관련 함수 (논블럭 버튼 처리)
+ * ============================================ */
+
+typedef enum {
+    UI_MODE_NORMAL,
+    UI_MODE_SET_ON_TIME,
+    UI_MODE_SET_OFF_TIME,
+    UI_MODE_VIEW_WEEKLY,
+    UI_MODE_VIEW_MONTHLY
+} UI_Mode_t;
+
+UI_Mode_t g_ui_mode = UI_MODE_NORMAL;
+
+// 버튼 디바운스용
+#define DEBOUNCE_DELAY 50  // ms
+uint32_t g_btn1_last_time = 0;
+uint32_t g_btn2_last_time = 0;
+uint32_t g_btn3_last_time = 0;
+
+// 버튼 1: 모드 변경 (EXTI 콜백에서 호출)
+void Button1_Pressed(void) {
+    uint32_t current_time = HAL_GetTick();
+    if(current_time - g_btn1_last_time < DEBOUNCE_DELAY) return;
+    g_btn1_last_time = current_time;
+    
+    g_ui_mode = (g_ui_mode + 1) % 5;  // 5개 모드 순환
+    // OLED 업데이트 (논블럭으로 처리)
+}
+
+// 버튼 2: 값 증가
+void Button2_Pressed(void) {
+    uint32_t current_time = HAL_GetTick();
+    if(current_time - g_btn2_last_time < DEBOUNCE_DELAY) return;
+    g_btn2_last_time = current_time;
+    
+    switch(g_ui_mode) {
+        case UI_MODE_SET_ON_TIME:
+            g_config.on_seconds += 10;  // 10초 단위
+            if(g_config.on_seconds > 600) g_config.on_seconds = 10;
+            break;
+        case UI_MODE_SET_OFF_TIME:
+            g_config.off_minutes += 1;   // 1분 단위
+            if(g_config.off_minutes > 60) g_config.off_minutes = 1;
+            break;
+        default:
+            break;
+    }
+    // OLED 업데이트
+}
+
+// 버튼 3: 저장
+void Button3_Pressed(void) {
+    uint32_t current_time = HAL_GetTick();
+    if(current_time - g_btn3_last_time < DEBOUNCE_DELAY) return;
+    g_btn3_last_time = current_time;
+    
+    if(g_ui_mode != UI_MODE_NORMAL) {
+        Config_Save();
+        g_ui_mode = UI_MODE_NORMAL;
+        // "저장됨" 메시지 표시
+    }
+}
+
+// GPIO EXTI 콜백 (버튼 인터럽트)
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+    switch(GPIO_Pin) {
+        case GPIO_PIN_X:  // 버튼1 핀 번호로 변경
+            Button1_Pressed();
+            break;
+        case GPIO_PIN_Y:  // 버튼2 핀 번호로 변경
+            Button2_Pressed();
+            break;
+        case GPIO_PIN_Z:  // 버튼3 핀 번호로 변경
+            Button3_Pressed();
+            break;
+    }
+}
+
+/* ============================================
+ * OLED 업데이트 (논블럭 방식)
+ * ============================================ */
+uint32_t g_oled_update_tick = 0;
+#define OLED_UPDATE_INTERVAL 100  // 100ms마다 업데이트
+
+// 시간 포맷 변환 (초 -> 시:분:초)
+void Format_Time(uint32_t total_seconds, char* buffer) {
+    uint32_t hours = total_seconds / 3600;
+    uint32_t minutes = (total_seconds % 3600) / 60;
+    uint32_t seconds = total_seconds % 60;
+    sprintf(buffer, "%uh %um %us", hours, minutes, seconds);
+}
+
+void OLED_Update_NonBlocking(void) {
+    uint32_t current_tick = HAL_GetTick();
+    
+    if(current_tick - g_oled_update_tick < OLED_UPDATE_INTERVAL) {
+        return;  // 아직 업데이트 시간 아님
+    }
+    
+    g_oled_update_tick = current_tick;
+    
+    // OLED 화면 갱신
+    char buffer[64];
+    
+    // 실제 OLED 라이브러리 함수로 교체 필요
+    /*
+    OLED_Clear();
+    
+    switch(g_ui_mode) {
+        case UI_MODE_NORMAL:
+            sprintf(buffer, "ON: %ds", g_config.on_seconds);
+            OLED_ShowString(0, 0, buffer);
+            
+            sprintf(buffer, "OFF: %dm", g_config.off_minutes);
+            OLED_ShowString(0, 16, buffer);
+            
+            // 현재 상태 표시
+            if(g_relay_state == 1) {
+                OLED_ShowString(0, 32, "RELAY: ON");
+            } else {
+                OLED_ShowString(0, 32, "RELAY: OFF");
+            }
+            
+            // 총 누적 시간
+            Format_Time(g_stats.total_on_seconds, buffer);
+            sprintf(buffer, "Total: %s", buffer);
+            OLED_ShowString(0, 48, buffer);
+            break;
+            
+        case UI_MODE_SET_ON_TIME:
+            OLED_ShowString(0, 0, ">> SET ON TIME");
+            sprintf(buffer, "Time: %d sec", g_config.on_seconds);
+            OLED_ShowString(0, 16, buffer);
+            OLED_ShowString(0, 32, "BTN2: +10s");
+            OLED_ShowString(0, 48, "BTN3: Save");
+            break;
+            
+        case UI_MODE_SET_OFF_TIME:
+            OLED_ShowString(0, 0, ">> SET OFF TIME");
+            sprintf(buffer, "Time: %d min", g_config.off_minutes);
+            OLED_ShowString(0, 16, buffer);
+            OLED_ShowString(0, 32, "BTN2: +1m");
+            OLED_ShowString(0, 48, "BTN3: Save");
+            break;
+            
+        case UI_MODE_VIEW_WEEKLY:
+            OLED_ShowString(0, 0, "WEEKLY STATS");
+            for(int i = 0; i < 4; i++) {
+                Format_Time(g_stats.weekly_on_seconds[i], buffer);
+                sprintf(buffer, "W%d: %s", i+1, buffer);
+                OLED_ShowString(0, 16 + i*12, buffer);
+            }
+            break;
+            
+        case UI_MODE_VIEW_MONTHLY:
+            OLED_ShowString(0, 0, "MONTHLY STATS");
+            
+            // 최근 3개월 표시
+            RTC_DateTypeDef date;
+            HAL_RTC_GetDate(&hrtc, &date, RTC_FORMAT_BIN);
+            int current_month = date.Month - 1;
+            
+            for(int i = 0; i < 3; i++) {
+                int month_idx = (current_month - i + 12) % 12;
+                Format_Time(g_stats.monthly_on_seconds[month_idx], buffer);
+                sprintf(buffer, "M%d: %s", month_idx+1, buffer);
+                OLED_ShowString(0, 16 + i*12, buffer);
+            }
+            break;
+    }
+    
+    OLED_Refresh();
+    */
+}
+
+/* ============================================
+ * 메인 함수에서 호출할 코드
+ * ============================================ */
+
+/*
+int main(void) {
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_RTC_Init();
+    // OLED 초기화...
+    
+    System_Init();
+    
+    while(1) {
+        // 시스템 상태 머신 처리
+        System_Process();
+        
+        // OLED 업데이트 (논블럭)
+        OLED_Update_NonBlocking();
+        
+        // 슬립 모드 진입 체크
+        // ON/OFF 각 실행 후 바로 슬립 진입
+        if(g_sleep_flag) {
+            Enter_StopMode();
+            // 깨어나면 여기서 계속 실행
+        }
+        
+        // 다른 태스크들...
+    }
+}
+*/
